@@ -1,16 +1,9 @@
-
 from datetime import datetime
 from typing import Any, List, Optional
 
 from agents import function_tool
 
-from .connection import get_connection
-
-
-def _close_cursor(cur) -> None:
-    conn = cur.connection
-    cur.close()
-    conn.close()
+from .database import db
 
 
 def _normalize_choice(value: str, choices: List[str]) -> Optional[str]:
@@ -67,46 +60,30 @@ def create_customer_profile(
         return "full_name is required."
 
     try:
-        birthdate_value = (
-            datetime.strptime(child_birthdate, "%Y-%m-%d").date()
-            if child_birthdate
-            else None
-        )
+        birthdate_value = child_birthdate if child_birthdate else None
+        if birthdate_value:
+            # Validate format
+            datetime.strptime(child_birthdate, "%Y-%m-%d")
     except ValueError:
         return "child_birthdate must use YYYY-MM-DD format."
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            INSERT INTO customers (
-                full_name,
-                email,
-                phone,
-                guardian_name,
-                child_name,
-                child_birthdate,
-                notes
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING customer_id
-            """,
-            (
-                full_name.strip(),
-                email.strip() or None,
-                phone.strip() or None,
-                guardian_name.strip() or None,
-                child_name.strip() or None,
-                birthdate_value,
-                notes.strip() or None,
-            ),
-        )
-        customer_id = cur.fetchone()[0]
-        conn.commit()
-        return f"Customer profile created. customer_id={customer_id}"
-    finally:
-        _close_cursor(cur)
+        data = {
+            "full_name": full_name.strip(),
+            "email": email.strip() or None,
+            "phone": phone.strip() or None,
+            "guardian_name": guardian_name.strip() or None,
+            "child_name": child_name.strip() or None,
+            "child_birthdate": birthdate_value,
+            "notes": notes.strip() or None,
+        }
+        result = db.insert("customers", data)
+        if result and len(result) > 0:
+            customer_id = result[0].get("customer_id")
+            return f"Customer profile created. customer_id={customer_id}"
+        return "Failed to create customer profile."
+    except Exception as e:
+        return f"Error creating customer: {e}"
 
 
 @function_tool
@@ -120,48 +97,38 @@ def search_products(
     Look up active products that match optional filters.
     """
     max_results = max(1, min(max_results, 20))
-    conn = get_connection()
-    cur = conn.cursor()
+    
     try:
-        conditions: List[str] = ["p.is_active = TRUE"]
-        params: List[Any] = []
+        # Build filters for Supabase
+        filters = ["is_active=eq.true"]
+        
+        endpoint = f"products?select=product_id,product_name,category,age_group,price_usd,stock_qty&{filters[0]}"
+        
         if keyword:
-            like = f"%{keyword}%"
-            conditions.append(
-                "(p.product_name ILIKE %s OR p.brand ILIKE %s OR COALESCE(p.sku, '') ILIKE %s)"
-            )
-            params.extend([like, like, like])
+            # Using or filter for keyword search
+            endpoint += f"&or=(product_name.ilike.*{keyword}*,brand.ilike.*{keyword}*,sku.ilike.*{keyword}*)"
         if category:
-            conditions.append("p.category ILIKE %s")
-            params.append(f"%{category}%")
+            endpoint += f"&category=ilike.*{category}*"
         if age_group:
-            conditions.append("p.age_group ILIKE %s")
-            params.append(f"%{age_group}%")
-
-        query = """
-            SELECT p.product_id, p.product_name, p.category, p.age_group, p.price_usd, p.stock_qty
-            FROM products p
-        """
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY p.stock_qty DESC, p.price_usd ASC LIMIT %s"
-        params.append(max_results)
-
-        cur.execute(query, params)
-        rows = cur.fetchall()
+            endpoint += f"&age_group=ilike.*{age_group}*"
+        
+        endpoint += f"&order=stock_qty.desc,price_usd.asc&limit={max_results}"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
             return "No matching toys found."
 
         lines = ["Matching toys:"]
-        for product_id, name, cat, age, price, stock in rows:
-            age_text = f" for ages {age}" if age else ""
+        for row in rows:
+            age_text = f" for ages {row['age_group']}" if row.get('age_group') else ""
             lines.append(
-                f"- #{product_id} {name} ({cat or 'Uncategorized'}{age_text}) - "
-                f"${price:.2f}, stock {stock}"
+                f"- #{row['product_id']} {row['product_name']} ({row.get('category') or 'Uncategorized'}{age_text}) - "
+                f"${row['price_usd']:.2f}, stock {row['stock_qty']}"
             )
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error searching products: {e}"
 
 
 @function_tool
@@ -169,58 +136,33 @@ def get_product_details(product_id: int) -> str:
     """
     Return enriched product information, including description and features.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT product_name, brand, category, age_group, material, color,
-                   price_usd, stock_qty, rating, description, features, country
-            FROM products
-            WHERE product_id = %s AND is_active = TRUE
-            """,
-            (product_id,),
-        )
-        row = cur.fetchone()
-        if not row:
+        row = db.get_by_id("products", "product_id", product_id)
+        
+        if not row or not row.get("is_active"):
             return "Toy not found or inactive."
 
-        (
-            name,
-            brand,
-            category,
-            age_group,
-            material,
-            color,
-            price,
-            stock_qty,
-            rating,
-            description,
-            features,
-            country,
-        ) = row
-
         details = [
-            f"{name} details:",
-            f"- Brand: {brand or 'N/A'}",
-            f"- Category: {category or 'N/A'}",
-            f"- Age group: {age_group or 'All ages'}",
-            f"- Material: {material or 'Not specified'}",
-            f"- Color: {color or 'Various'}",
-            f"- Price: ${price:.2f}",
-            f"- Stock: {stock_qty}",
+            f"{row['product_name']} details:",
+            f"- Brand: {row.get('brand') or 'N/A'}",
+            f"- Category: {row.get('category') or 'N/A'}",
+            f"- Age group: {row.get('age_group') or 'All ages'}",
+            f"- Material: {row.get('material') or 'Not specified'}",
+            f"- Color: {row.get('color') or 'Various'}",
+            f"- Price: ${row['price_usd']:.2f}",
+            f"- Stock: {row['stock_qty']}",
         ]
-        if rating is not None:
-            details.append(f"- Rating: {rating:.2f}/5")
-        if country:
-            details.append(f"- Country of origin: {country}")
-        if description:
-            details.append(f"\nDescription:\n{description.strip()}")
-        if features:
-            details.append(f"\nFeatures:\n{features.strip()}")
+        if row.get('rating') is not None:
+            details.append(f"- Rating: {row['rating']:.2f}/5")
+        if row.get('country'):
+            details.append(f"- Country of origin: {row['country']}")
+        if row.get('description'):
+            details.append(f"\nDescription:\n{row['description'].strip()}")
+        if row.get('features'):
+            details.append(f"\nFeatures:\n{row['features'].strip()}")
         return "\n".join(details)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error getting product details: {e}"
 
 
 @function_tool
@@ -228,43 +170,33 @@ def get_ticket_pricing(location_name: str = "") -> str:
     """
     Summarize active ticket pricing, optionally filtered by location name.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        params: List[Any] = []
-        query = """
-            SELECT
-                t.name,
-                t.base_price_usd,
-                t.requires_waiver,
-                t.requires_grip_socks,
-                COALESCE(l.name, 'All Locations') AS location_name
-            FROM ticket_types t
-            LEFT JOIN locations l ON l.location_id = t.location_id
-            WHERE t.is_active = TRUE
-        """
-        if location_name:
-            query += " AND COALESCE(l.name, 'All Locations') ILIKE %s"
-            params.append(f"%{location_name}%")
-        query += " ORDER BY COALESCE(l.name, 'All Locations'), t.base_price_usd"
-
-        cur.execute(query, params)
-        rows = cur.fetchall()
+        endpoint = "ticket_types?select=name,base_price_usd,requires_waiver,requires_grip_socks,location_id,locations(name)&is_active=eq.true&order=base_price_usd"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
-            return "No ticket options available for that location."
+            return "No ticket options available."
 
         lines = ["Admission ticket pricing:"]
-        for name, price, waiver, socks, location in rows:
+        for row in rows:
+            location = row.get("locations", {}).get("name") if row.get("locations") else "All Locations"
+            if location_name and location_name.lower() not in (location or "").lower():
+                continue
+            
             tags: List[str] = []
-            if waiver:
+            if row.get("requires_waiver"):
                 tags.append("waiver required")
-            if socks:
+            if row.get("requires_grip_socks"):
                 tags.append("grip socks required")
             tag_text = f" ({', '.join(tags)})" if tags else ""
-            lines.append(f"- {location}: {name} - ${price:.2f}{tag_text}")
+            lines.append(f"- {location}: {row['name']} - ${row['base_price_usd']:.2f}{tag_text}")
+        
+        if len(lines) == 1:
+            return "No ticket options available for that location."
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error getting ticket pricing: {e}"
 
 
 @function_tool
@@ -272,79 +204,43 @@ def list_party_packages(location_name: str = "") -> str:
     """
     List party packages with pricing and inclusions.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        params: List[Any] = []
-        query = """
-            SELECT
-                COALESCE(l.name, 'All Locations') AS location_name,
-                pp.name,
-                pp.price_usd,
-                pp.base_children,
-                pp.base_room_hours,
-                pp.includes_food,
-                pp.includes_drinks,
-                pp.includes_decor,
-                STRING_AGG(
-                    pi.item_name || ' x' || COALESCE(pi.quantity::TEXT, '1'),
-                    ', ' ORDER BY pi.item_name
-                ) AS inclusions
-            FROM party_packages pp
-            LEFT JOIN locations l ON l.location_id = pp.location_id
-            LEFT JOIN package_inclusions pi ON pi.package_id = pp.package_id
-            WHERE pp.is_active = TRUE
-        """
-        if location_name:
-            query += " AND COALESCE(l.name, 'All Locations') ILIKE %s"
-            params.append(f"%{location_name}%")
-        query += """
-            GROUP BY
-                COALESCE(l.name, 'All Locations'),
-                pp.package_id,
-                pp.name,
-                pp.price_usd,
-                pp.base_children,
-                pp.base_room_hours,
-                pp.includes_food,
-                pp.includes_drinks,
-                pp.includes_decor
-            ORDER BY COALESCE(l.name, 'All Locations'), pp.price_usd
-        """
-
-        cur.execute(query, params)
-        rows = cur.fetchall()
+        endpoint = "party_packages?select=*,locations(name),package_inclusions(item_name,quantity)&is_active=eq.true&order=price_usd"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
             return "No party packages found."
 
         lines = ["Party packages:"]
-        for (
-            location,
-            name,
-            price,
-            base_children,
-            base_hours,
-            food,
-            drinks,
-            decor,
-            inclusions,
-        ) in rows:
+        for row in rows:
+            location = row.get("locations", {}).get("name") if row.get("locations") else "All Locations"
+            if location_name and location_name.lower() not in (location or "").lower():
+                continue
+            
             perks: List[str] = []
-            if food:
+            if row.get("includes_food"):
                 perks.append("food")
-            if drinks:
+            if row.get("includes_drinks"):
                 perks.append("drinks")
-            if decor:
+            if row.get("includes_decor"):
                 perks.append("decor")
             perk_text = f" Includes {', '.join(perks)}." if perks else ""
-            inclusion_text = f" Inclusions: {inclusions}." if inclusions else ""
+            
+            inclusions = row.get("package_inclusions") or []
+            inclusion_items = [f"{i['item_name']} x{i.get('quantity', 1)}" for i in inclusions]
+            inclusion_text = f" Inclusions: {', '.join(inclusion_items)}." if inclusion_items else ""
+            
             lines.append(
-                f"- {location}: {name} - ${price:.2f} for {base_children} kids, "
-                f"{base_hours:g} hours.{perk_text}{inclusion_text}"
+                f"- {location}: {row['name']} - ${row['price_usd']:.2f} for {row['base_children']} kids, "
+                f"{row['base_room_hours']}h.{perk_text}{inclusion_text}"
             )
+        
+        if len(lines) == 1:
+            return "No party packages found for that location."
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error listing party packages: {e}"
 
 
 @function_tool
@@ -364,43 +260,36 @@ def get_party_availability(
     if end <= start:
         return "end_datetime must be after start_datetime."
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        params: List[Any] = [end, start]
-        query = """
-            SELECT
-                r.name AS room_name,
-                pb.scheduled_start,
-                pb.scheduled_end,
-                pb.status,
-                l.name AS location_name
-            FROM party_bookings pb
-            JOIN resources r ON r.resource_id = pb.resource_id
-            JOIN locations l ON l.location_id = r.location_id
-            WHERE pb.status IN ('Pending', 'Confirmed')
-              AND pb.scheduled_start < %s
-              AND pb.scheduled_end > %s
-        """
-        if location_name:
-            query += " AND l.name ILIKE %s"
-            params.append(f"%{location_name}%")
-        query += " ORDER BY COALESCE(l.name, ''), r.name, pb.scheduled_start"
-
-        cur.execute(query, params)
-        rows = cur.fetchall()
+        endpoint = f"party_bookings?select=scheduled_start,scheduled_end,status,resources(name,locations(name))&status=in.(Pending,Confirmed)&scheduled_start=lt.{end.isoformat()}&scheduled_end=gt.{start.isoformat()}&order=scheduled_start"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
             return "No existing bookings; all rooms appear open in that window."
 
         lines = ["Booked party slots in that window:"]
-        for room_name, booked_start, booked_end, status, loc_name in rows:
+        for row in rows:
+            resource = row.get("resources") or {}
+            room_name = resource.get("name", "Unknown Room")
+            loc = resource.get("locations", {}).get("name") if resource.get("locations") else "Unknown"
+            
+            if location_name and location_name.lower() not in (loc or "").lower():
+                continue
+            
+            booked_start = datetime.fromisoformat(row["scheduled_start"].replace("Z", "+00:00"))
+            booked_end = datetime.fromisoformat(row["scheduled_end"].replace("Z", "+00:00"))
+            
             lines.append(
-                f"- {loc_name} - {room_name} booked {booked_start:%Y-%m-%d %H:%M} "
-                f"to {booked_end:%H:%M} ({status})"
+                f"- {loc} - {room_name} booked {booked_start:%Y-%m-%d %H:%M} "
+                f"to {booked_end:%H:%M} ({row['status']})"
             )
+        
+        if len(lines) == 1:
+            return "No existing bookings for that location; all rooms appear open in that window."
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error checking party availability: {e}"
 
 
 @function_tool
@@ -433,70 +322,40 @@ def create_party_booking(
     if end_dt <= start_dt:
         return "scheduled_end must be after scheduled_start."
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            "SELECT 1 FROM customers WHERE customer_id = %s",
-            (customer_id,),
-        )
-        if not cur.fetchone():
-            conn.rollback()
+        # Check customer exists
+        customer = db.get_by_id("customers", "customer_id", customer_id)
+        if not customer:
             return "Customer not found. Please create a customer profile first."
 
-        # Ensure the room is available
-        cur.execute(
-            """
-            SELECT 1
-            FROM party_bookings
-            WHERE resource_id = %s
-              AND status IN ('Pending', 'Confirmed')
-              AND scheduled_start < %s
-              AND scheduled_end > %s
-            LIMIT 1
-            """,
-            (resource_id, end_dt, start_dt),
-        )
-        if cur.fetchone():
-            conn.rollback()
+        # Check room availability
+        endpoint = f"party_bookings?select=booking_id&resource_id=eq.{resource_id}&status=in.(Pending,Confirmed)&scheduled_start=lt.{end_dt.isoformat()}&scheduled_end=gt.{start_dt.isoformat()}&limit=1"
+        conflicts = db._make_request("GET", endpoint)
+        if conflicts:
             return "That room is already booked during the requested time."
 
-        cur.execute(
-            """
-            INSERT INTO party_bookings (
-                package_id,
-                resource_id,
-                customer_id,
-                scheduled_start,
-                scheduled_end,
-                status,
-                additional_kids,
-                additional_guests,
-                special_requests
+        data = {
+            "package_id": package_id,
+            "resource_id": resource_id,
+            "customer_id": customer_id,
+            "scheduled_start": start_dt.isoformat(),
+            "scheduled_end": end_dt.isoformat(),
+            "status": normalized_status,
+            "additional_kids": additional_kids,
+            "additional_guests": additional_guests,
+            "special_requests": special_requests.strip() or None,
+        }
+        
+        result = db.insert("party_bookings", data)
+        if result and len(result) > 0:
+            booking_id = result[0].get("booking_id")
+            return (
+                f"Created party booking #{booking_id} from {start_dt:%Y-%m-%d %H:%M} "
+                f"to {end_dt:%Y-%m-%d %H:%M} with status {normalized_status}."
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING booking_id
-            """,
-            (
-                package_id,
-                resource_id,
-                customer_id,
-                start_dt,
-                end_dt,
-                normalized_status,
-                additional_kids,
-                additional_guests,
-                special_requests.strip() or None,
-            ),
-        )
-        booking_id = cur.fetchone()[0]
-        conn.commit()
-        return (
-            f"Created party booking #{booking_id} from {start_dt:%Y-%m-%d %H:%M} "
-            f"to {end_dt:%Y-%m-%d %H:%M} with status {normalized_status}."
-        )
-    finally:
-        _close_cursor(cur)
+        return "Failed to create party booking."
+    except Exception as e:
+        return f"Error creating party booking: {e}"
 
 
 @function_tool
@@ -513,151 +372,94 @@ def update_party_booking(
     """
     Update fields on an existing party booking. Provide at least one field to change.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT resource_id, scheduled_start, scheduled_end, status
-            FROM party_bookings
-            WHERE booking_id = %s
-            FOR UPDATE
-            """,
-            (booking_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            conn.rollback()
+        # Get current booking
+        booking = db.get_by_id("party_bookings", "booking_id", booking_id)
+        if not booking:
             return "Booking not found."
 
-        resource_id, current_start, current_end, current_status = row
+        resource_id = booking["resource_id"]
+        current_start = datetime.fromisoformat(booking["scheduled_start"].replace("Z", "+00:00"))
+        current_end = datetime.fromisoformat(booking["scheduled_end"].replace("Z", "+00:00"))
+        current_status = booking["status"]
 
-        updates: List[str] = []
-        params: List[Any] = []
-
-        new_start_dt = None
-        new_end_dt = None
+        updates = {}
 
         if status:
             normalized_status = _normalize_choice(status, PARTY_STATUSES)
             if not normalized_status:
-                conn.rollback()
                 return "Status must be one of: " + ", ".join(PARTY_STATUSES)
-            updates.append("status = %s")
-            params.append(normalized_status)
+            updates["status"] = normalized_status
         else:
             normalized_status = current_status
+
+        new_start_dt = None
+        new_end_dt = None
 
         if scheduled_start:
             try:
                 new_start_dt = datetime.fromisoformat(scheduled_start)
             except ValueError:
-                conn.rollback()
                 return "Invalid scheduled_start datetime format."
 
         if scheduled_end:
             try:
                 new_end_dt = datetime.fromisoformat(scheduled_end)
             except ValueError:
-                conn.rollback()
                 return "Invalid scheduled_end datetime format."
 
         final_start = new_start_dt or current_start
         final_end = new_end_dt or current_end
         if final_end <= final_start:
-            conn.rollback()
             return "scheduled_end must be after scheduled_start."
 
         schedule_changed = (new_start_dt is not None) or (new_end_dt is not None)
         if schedule_changed:
-            updates.append("scheduled_start = %s")
-            params.append(final_start)
-            updates.append("scheduled_end = %s")
-            params.append(final_end)
+            updates["scheduled_start"] = final_start.isoformat()
+            updates["scheduled_end"] = final_end.isoformat()
 
-            cur.execute(
-                """
-                SELECT 1
-                FROM party_bookings
-                WHERE resource_id = %s
-                  AND booking_id <> %s
-                  AND status IN ('Pending', 'Confirmed')
-                  AND scheduled_start < %s
-                  AND scheduled_end > %s
-                LIMIT 1
-                """,
-                (resource_id, booking_id, final_end, final_start),
-            )
-            if cur.fetchone():
-                conn.rollback()
+            # Check for conflicts
+            endpoint = f"party_bookings?select=booking_id&resource_id=eq.{resource_id}&booking_id=neq.{booking_id}&status=in.(Pending,Confirmed)&scheduled_start=lt.{final_end.isoformat()}&scheduled_end=gt.{final_start.isoformat()}&limit=1"
+            conflicts = db._make_request("GET", endpoint)
+            if conflicts:
                 return "That room is already booked during the requested time."
 
         if additional_kids is not None:
             if additional_kids < 0:
-                conn.rollback()
                 return "additional_kids must be zero or greater."
-            updates.append("additional_kids = %s")
-            params.append(additional_kids)
+            updates["additional_kids"] = additional_kids
 
         if additional_guests is not None:
             if additional_guests < 0:
-                conn.rollback()
                 return "additional_guests must be zero or greater."
-            updates.append("additional_guests = %s")
-            params.append(additional_guests)
+            updates["additional_guests"] = additional_guests
 
         if special_requests is not None:
-            updates.append("special_requests = %s")
-            params.append(special_requests.strip() or None)
+            updates["special_requests"] = special_requests.strip() or None
 
         if not updates:
-            conn.rollback()
             return "No updates were provided."
 
-        params.append(booking_id)
-        cur.execute(
-            f"""
-            UPDATE party_bookings
-            SET {", ".join(updates)}
-            WHERE booking_id = %s
-            """,
-            params,
-        )
+        db.update("party_bookings", "booking_id", booking_id, updates)
 
+        # Record reschedule if schedule changed
         if schedule_changed and (final_start != current_start or final_end != current_end):
-            cur.execute(
-                """
-                INSERT INTO party_reschedules (
-                    booking_id,
-                    old_start,
-                    old_end,
-                    new_start,
-                    new_end,
-                    reason
-                )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    booking_id,
-                    current_start,
-                    current_end,
-                    final_start,
-                    final_end,
-                    reschedule_reason.strip() or None,
-                ),
-            )
+            reschedule_data = {
+                "booking_id": booking_id,
+                "old_start": current_start.isoformat(),
+                "old_end": current_end.isoformat(),
+                "new_start": final_start.isoformat(),
+                "new_end": final_end.isoformat(),
+                "reason": reschedule_reason.strip() or None,
+            }
+            db.insert("party_reschedules", reschedule_data)
 
-        conn.commit()
-        response = (
-            f"Updated party booking #{booking_id}. Current status: {normalized_status}."
-        )
+        response = f"Updated party booking #{booking_id}. Current status: {normalized_status}."
         if schedule_changed:
-            response += (
-                f" New schedule: {final_start:%Y-%m-%d %H:%M} to {final_end:%Y-%m-%d %H:%M}."
-            )
+            response += f" New schedule: {final_start:%Y-%m-%d %H:%M} to {final_end:%Y-%m-%d %H:%M}."
         return response
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error updating party booking: {e}"
 
 
 @function_tool
@@ -665,29 +467,20 @@ def get_store_policies(topic: str = "") -> str:
     """
     Retrieve active policy notes, optionally filtered by a keyword.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        params: List[Any] = []
-        query = """
-            SELECT key, value
-            FROM policies
-            WHERE is_active = TRUE
-        """
+        endpoint = "policies?select=key,value&is_active=eq.true&order=key"
+        
         if topic:
-            query += " AND (key ILIKE %s OR value ILIKE %s)"
-            like = f"%{topic}%"
-            params.extend([like, like])
-        query += " ORDER BY key"
-
-        cur.execute(query, params)
-        rows = cur.fetchall()
+            endpoint += f"&or=(key.ilike.*{topic}*,value.ilike.*{topic}*)"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
             return "No active policies found for that topic."
 
-        return "\n".join(f"- {key}: {value}" for key, value in rows)
-    finally:
-        _close_cursor(cur)
+        return "\n".join(f"- {row['key']}: {row['value']}" for row in rows)
+    except Exception as e:
+        return f"Error getting store policies: {e}"
 
 
 @function_tool
@@ -695,55 +488,29 @@ def list_store_locations(only_active: bool = True) -> str:
     """
     List store locations and their contact details.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        query = """
-            SELECT
-                l.location_id,
-                l.name,
-                l.address_line,
-                l.city,
-                l.state,
-                l.postal_code,
-                l.country,
-                l.phone,
-                l.email,
-                l.is_active
-            FROM locations l
-            ORDER BY l.name
-        """
+        endpoint = "locations?select=location_id,name,address_line,city,state,postal_code,country,phone,email,is_active&order=name"
+        
         if only_active:
-            query = query.replace("ORDER BY", "WHERE l.is_active = TRUE ORDER BY")
-
-        cur.execute(query)
-        rows = cur.fetchall()
+            endpoint += "&is_active=eq.true"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
             return "No locations found."
 
         lines = ["Store locations:"]
-        for (
-            location_id,
-            name,
-            address,
-            city,
-            state,
-            postal_code,
-            country,
-            phone,
-            email,
-            is_active,
-        ) in rows:
-            status = "Active" if is_active else "Inactive"
-            address_parts = [part for part in [address, city, state, postal_code] if part]
+        for row in rows:
+            status = "Active" if row.get("is_active") else "Inactive"
+            address_parts = [part for part in [row.get("address_line"), row.get("city"), row.get("state"), row.get("postal_code")] if part]
             address_str = ", ".join(address_parts)
             lines.append(
-                f"- #{location_id} {name} ({status}) – {address_str or 'Address not set'}; "
-                f"Phone: {phone or 'N/A'}; Email: {email or 'N/A'}; Country: {country or 'N/A'}"
+                f"- #{row['location_id']} {row['name']} ({status}) – {address_str or 'Address not set'}; "
+                f"Phone: {row.get('phone') or 'N/A'}; Email: {row.get('email') or 'N/A'}; Country: {row.get('country') or 'N/A'}"
             )
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error listing store locations: {e}"
 
 
 @function_tool
@@ -752,43 +519,36 @@ def search_orders(status: str = "", customer_name: str = "", limit: int = 5) -> 
     Search orders by status or customer name.
     """
     limit = max(1, min(limit, 20))
-    conn = get_connection()
-    cur = conn.cursor()
+    
     try:
-        conditions: List[str] = []
-        params: List[Any] = []
+        endpoint = f"orders?select=order_id,order_type,status,total_usd,created_at,customers(full_name)&order=created_at.desc&limit={limit}"
+        
         if status:
-            conditions.append("LOWER(o.status) = LOWER(%s)")
-            params.append(status)
+            endpoint += f"&status=ilike.{status}"
+        
+        rows = db._make_request("GET", endpoint)
+        
+        if not rows:
+            return "No orders matched those filters."
+
+        # Filter by customer name if provided (client-side filter due to join complexity)
         if customer_name:
-            conditions.append("c.full_name ILIKE %s")
-            params.append(f"%{customer_name}%")
+            rows = [r for r in rows if r.get("customers") and customer_name.lower() in r["customers"].get("full_name", "").lower()]
 
-        query = """
-            SELECT o.order_id, o.order_type, o.status, o.total_usd, o.created_at,
-                   COALESCE(c.full_name, 'Guest') AS customer_name
-            FROM orders o
-            LEFT JOIN customers c ON c.customer_id = o.customer_id
-        """
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY o.created_at DESC LIMIT %s"
-        params.append(limit)
-
-        cur.execute(query, params)
-        rows = cur.fetchall()
         if not rows:
             return "No orders matched those filters."
 
         lines = ["Matching orders:"]
-        for order_id, order_type, status_val, total, created, customer in rows:
+        for row in rows:
+            customer = row.get("customers", {}).get("full_name") if row.get("customers") else "Guest"
+            created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             lines.append(
-                f"- #{order_id} {customer} - {order_type} {status_val} "
-                f"(${total:.2f}) created {created:%Y-%m-%d}"
+                f"- #{row['order_id']} {customer} - {row['order_type']} {row['status']} "
+                f"(${row['total_usd']:.2f}) created {created:%Y-%m-%d}"
             )
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error searching orders: {e}"
 
 
 @function_tool
@@ -797,32 +557,25 @@ def list_customer_orders(customer_id: int, limit: int = 5) -> str:
     List recent orders for a specific customer.
     """
     limit = max(1, min(limit, 20))
-    conn = get_connection()
-    cur = conn.cursor()
+    
     try:
-        cur.execute(
-            """
-            SELECT order_id, order_type, status, total_usd, created_at
-            FROM orders
-            WHERE customer_id = %s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
-            (customer_id, limit),
-        )
-        rows = cur.fetchall()
+        endpoint = f"orders?select=order_id,order_type,status,total_usd,created_at&customer_id=eq.{customer_id}&order=created_at.desc&limit={limit}"
+        
+        rows = db._make_request("GET", endpoint)
+        
         if not rows:
             return "No orders found for that customer."
 
         lines = [f"Recent orders for customer #{customer_id}:"]
-        for order_id, order_type, status, total, created in rows:
+        for row in rows:
+            created = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
             lines.append(
-                f"- #{order_id} {order_type} {status} - ${total:.2f} on "
+                f"- #{row['order_id']} {row['order_type']} {row['status']} - ${row['total_usd']:.2f} on "
                 f"{created:%Y-%m-%d}"
             )
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error listing customer orders: {e}"
 
 
 @function_tool
@@ -830,135 +583,95 @@ def get_order_details(order_id: int) -> str:
     """
     Provide a detailed view of an order, including items, payments, and refunds.
     """
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT o.order_id, o.order_type, o.status, o.subtotal_usd,
-                   o.discount_usd, o.tax_usd, o.total_usd, o.notes,
-                   o.created_at, o.updated_at,
-                   COALESCE(c.full_name, 'Guest') AS customer_name,
-                   COALESCE(c.email, '') AS customer_email,
-                   COALESCE(l.name, 'All Locations') AS location_name
-            FROM orders o
-            LEFT JOIN customers c ON c.customer_id = o.customer_id
-            LEFT JOIN locations l ON l.location_id = o.location_id
-            WHERE o.order_id = %s
-            """,
-            (order_id,),
-        )
-        order_row = cur.fetchone()
-        if not order_row:
+        # Get order with customer and location
+        endpoint = f"orders?select=*,customers(full_name,email),locations(name)&order_id=eq.{order_id}"
+        order_rows = db._make_request("GET", endpoint)
+        
+        if not order_rows:
             return "Order not found."
 
-        (
-            _order_id,
-            order_type,
-            status,
-            subtotal,
-            discount,
-            tax,
-            total,
-            notes,
-            created_at,
-            updated_at,
-            customer_name,
-            customer_email,
-            location_name,
-        ) = order_row
+        order = order_rows[0]
+        customer = order.get("customers") or {}
+        location = order.get("locations") or {}
+
+        customer_name = customer.get("full_name", "Guest")
+        customer_email = customer.get("email", "")
+        location_name = location.get("name", "All Locations")
 
         customer_line = f"Customer: {customer_name}"
         if customer_email:
             customer_line += f" ({customer_email})"
 
+        created_at = datetime.fromisoformat(order["created_at"].replace("Z", "+00:00"))
+        updated_at = datetime.fromisoformat(order["updated_at"].replace("Z", "+00:00"))
+
         lines = [
-            f"Order #{order_id} ({order_type}) - {status}",
+            f"Order #{order_id} ({order['order_type']}) - {order['status']}",
             customer_line,
             f"Location: {location_name}",
             (
                 "Totals: "
-                f"subtotal ${subtotal:.2f}, discount ${discount:.2f}, "
-                f"tax ${tax:.2f}, total ${total:.2f}"
+                f"subtotal ${order['subtotal_usd']:.2f}, discount ${order['discount_usd']:.2f}, "
+                f"tax ${order['tax_usd']:.2f}, total ${order['total_usd']:.2f}"
             ),
             f"Created: {created_at:%Y-%m-%d %H:%M}",
             f"Updated: {updated_at:%Y-%m-%d %H:%M}",
         ]
-        if notes:
-            lines.append(f"Notes:\n{notes.strip()}")
+        if order.get("notes"):
+            lines.append(f"Notes:\n{order['notes'].strip()}")
 
-        cur.execute(
-            """
-            SELECT item_type,
-                   COALESCE(
-                       name_override,
-                       CASE
-                           WHEN item_type = 'Product' THEN p.product_name
-                           WHEN item_type = 'Ticket' THEN t.name
-                           WHEN item_type = 'Party' THEN CONCAT('Party booking ', oi.booking_id::text)
-                           ELSE 'Line item'
-                       END
-                   ) AS display_name,
-                   quantity,
-                   unit_price_usd,
-                   line_total_usd
-            FROM order_items oi
-            LEFT JOIN products p ON p.product_id = oi.product_id
-            LEFT JOIN ticket_types t ON t.ticket_type_id = oi.ticket_type_id
-            WHERE oi.order_id = %s
-            ORDER BY oi.order_item_id
-            """,
-            (order_id,),
-        )
-        items = cur.fetchall()
+        # Get order items
+        items_endpoint = f"order_items?select=item_type,name_override,quantity,unit_price_usd,line_total_usd,products(product_name),ticket_types(name)&order_id=eq.{order_id}&order=order_item_id"
+        items = db._make_request("GET", items_endpoint)
+        
         if items:
             lines.append("\nItems:")
-            for item_type, display_name, qty, unit_price, line_total in items:
+            for item in items:
+                if item.get("name_override"):
+                    display_name = item["name_override"]
+                elif item["item_type"] == "Product" and item.get("products"):
+                    display_name = item["products"]["product_name"]
+                elif item["item_type"] == "Ticket" and item.get("ticket_types"):
+                    display_name = item["ticket_types"]["name"]
+                else:
+                    display_name = "Line item"
+                
                 lines.append(
-                    f"- {display_name} ({item_type}) x{qty} @ ${unit_price:.2f} "
-                    f"= ${line_total:.2f}"
+                    f"- {display_name} ({item['item_type']}) x{item['quantity']} @ ${item['unit_price_usd']:.2f} "
+                    f"= ${item['line_total_usd']:.2f}"
                 )
 
-        cur.execute(
-            """
-            SELECT payment_id, provider, status, amount_usd, created_at
-            FROM payments
-            WHERE order_id = %s
-            ORDER BY created_at DESC
-            """,
-            (order_id,),
-        )
-        payments = cur.fetchall()
+        # Get payments
+        payments_endpoint = f"payments?select=payment_id,provider,status,amount_usd,created_at&order_id=eq.{order_id}&order=created_at.desc"
+        payments = db._make_request("GET", payments_endpoint)
+        
         if payments:
             lines.append("\nPayments:")
-            for payment_id, provider, payment_status, amount, created in payments:
+            for payment in payments:
+                created = datetime.fromisoformat(payment["created_at"].replace("Z", "+00:00"))
                 lines.append(
-                    f"- Payment #{payment_id} via {provider} {payment_status} "
-                    f"for ${amount:.2f} on {created:%Y-%m-%d}"
+                    f"- Payment #{payment['payment_id']} via {payment['provider']} {payment['status']} "
+                    f"for ${payment['amount_usd']:.2f} on {created:%Y-%m-%d}"
                 )
 
-        cur.execute(
-            """
-            SELECT refund_id, status, amount_usd, created_at, COALESCE(reason, '')
-            FROM refunds
-            WHERE order_id = %s
-            ORDER BY created_at DESC
-            """,
-            (order_id,),
-        )
-        refunds = cur.fetchall()
+        # Get refunds
+        refunds_endpoint = f"refunds?select=refund_id,status,amount_usd,created_at,reason&order_id=eq.{order_id}&order=created_at.desc"
+        refunds = db._make_request("GET", refunds_endpoint)
+        
         if refunds:
             lines.append("\nRefunds:")
-            for refund_id, refund_status, amount, created, reason in refunds:
-                reason_text = f" ({reason})" if reason else ""
+            for refund in refunds:
+                created = datetime.fromisoformat(refund["created_at"].replace("Z", "+00:00"))
+                reason_text = f" ({refund['reason']})" if refund.get("reason") else ""
                 lines.append(
-                    f"- Refund #{refund_id} {refund_status} for ${amount:.2f} "
+                    f"- Refund #{refund['refund_id']} {refund['status']} for ${refund['amount_usd']:.2f} "
                     f"on {created:%Y-%m-%d}{reason_text}"
                 )
 
         return "\n".join(lines)
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error getting order details: {e}"
 
 
 @function_tool
@@ -970,38 +683,26 @@ def update_order_status(order_id: int, new_status: str, note: str = "") -> str:
     if not normalized:
         return "Status must be one of: " + ", ".join(ORDER_STATUSES)
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        if note.strip():
-            note_entry = f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {note.strip()}"
-            cur.execute(
-                """
-                UPDATE orders
-                SET status = %s,
-                    updated_at = NOW(),
-                    notes = COALESCE(notes, '') || %s
-                WHERE order_id = %s
-                """,
-                (normalized, note_entry, order_id),
-            )
-        else:
-            cur.execute(
-                """
-                UPDATE orders
-                SET status = %s,
-                    updated_at = NOW()
-                WHERE order_id = %s
-                """,
-                (normalized, order_id),
-            )
-        if cur.rowcount == 0:
-            conn.rollback()
+        # Get existing order
+        order = db.get_by_id("orders", "order_id", order_id)
+        if not order:
             return "Order not found."
-        conn.commit()
+
+        updates = {
+            "status": normalized,
+            "updated_at": datetime.now().isoformat(),
+        }
+        
+        if note.strip():
+            existing_notes = order.get("notes") or ""
+            note_entry = f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M')}] {note.strip()}"
+            updates["notes"] = existing_notes + note_entry
+
+        db.update("orders", "order_id", order_id, updates)
         return f"Updated order {order_id} to {normalized}."
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error updating order status: {e}"
 
 
 @function_tool
@@ -1024,71 +725,45 @@ def add_order_item(
     if unit_price_usd < 0:
         return "Unit price must be zero or greater."
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT subtotal_usd, discount_usd, tax_usd
-            FROM orders
-            WHERE order_id = %s
-            """,
-            (order_id,),
-        )
-        order_row = cur.fetchone()
-        if not order_row:
-            conn.rollback()
+        order = db.get_by_id("orders", "order_id", order_id)
+        if not order:
             return "Order not found."
 
-        subtotal, discount, tax = order_row
+        subtotal = float(order.get("subtotal_usd") or 0)
+        discount = float(order.get("discount_usd") or 0)
+        tax = float(order.get("tax_usd") or 0)
         line_total = round(quantity * unit_price_usd, 2)
 
-        product_id = reference_id if normalized_type == "Product" else None
-        ticket_type_id = reference_id if normalized_type == "Ticket" else None
-        booking_id = reference_id if normalized_type == "Party" else None
+        item_data = {
+            "order_id": order_id,
+            "item_type": normalized_type,
+            "product_id": reference_id if normalized_type == "Product" else None,
+            "ticket_type_id": reference_id if normalized_type == "Ticket" else None,
+            "booking_id": reference_id if normalized_type == "Party" else None,
+            "name_override": name_override.strip() or None,
+            "quantity": quantity,
+            "unit_price_usd": unit_price_usd,
+            "line_total_usd": line_total,
+        }
+        
+        db.insert("order_items", item_data)
 
-        cur.execute(
-            """
-            INSERT INTO order_items (
-                order_id, item_type, product_id, ticket_type_id, booking_id,
-                name_override, quantity, unit_price_usd, line_total_usd
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                order_id,
-                normalized_type,
-                product_id,
-                ticket_type_id,
-                booking_id,
-                name_override.strip() or None,
-                quantity,
-                unit_price_usd,
-                line_total,
-            ),
-        )
+        new_subtotal = subtotal + line_total
+        new_total = new_subtotal - discount + tax
 
-        new_subtotal = float(subtotal or 0) + line_total
-        new_total = new_subtotal - float(discount or 0) + float(tax or 0)
+        db.update("orders", "order_id", order_id, {
+            "subtotal_usd": new_subtotal,
+            "total_usd": new_total,
+            "updated_at": datetime.now().isoformat(),
+        })
 
-        cur.execute(
-            """
-            UPDATE orders
-            SET subtotal_usd = %s,
-                total_usd = %s,
-                updated_at = NOW()
-            WHERE order_id = %s
-            """,
-            (new_subtotal, new_total, order_id),
-        )
-
-        conn.commit()
         return (
             f"Added {quantity} x {normalized_type} item to order {order_id}; "
             f"new total ${new_total:.2f}."
         )
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error adding order item: {e}"
 
 
 @function_tool
@@ -1119,68 +794,49 @@ def create_order_with_item(
         "Party": "Party",
     }
     order_type = order_type_map[normalized_type]
-
     line_total = round(quantity * unit_price_usd, 2)
-    conn = get_connection()
-    cur = conn.cursor()
+
     try:
-        cur.execute(
-            "SELECT 1 FROM customers WHERE customer_id = %s",
-            (customer_id,),
-        )
-        if not cur.fetchone():
-            conn.rollback()
+        # Check customer exists
+        customer = db.get_by_id("customers", "customer_id", customer_id)
+        if not customer:
             return "Customer not found. Please create a customer profile before creating an order."
 
-        cur.execute(
-            """
-            INSERT INTO orders (
-                customer_id, location_id, order_type, status,
-                subtotal_usd, discount_usd, tax_usd, total_usd, notes
-            )
-            VALUES (%s, %s, %s, 'Pending', %s, 0, 0, %s, %s)
-            RETURNING order_id
-            """,
-            (
-                customer_id,
-                location_id,
-                order_type,
-                line_total,
-                line_total,
-                note.strip() or None,
-            ),
-        )
-        order_id = cur.fetchone()[0]
+        order_data = {
+            "customer_id": customer_id,
+            "location_id": location_id,
+            "order_type": order_type,
+            "status": "Pending",
+            "subtotal_usd": line_total,
+            "discount_usd": 0,
+            "tax_usd": 0,
+            "total_usd": line_total,
+            "notes": note.strip() or None,
+        }
+        
+        order_result = db.insert("orders", order_data)
+        if not order_result or len(order_result) == 0:
+            return "Failed to create order."
+        
+        order_id = order_result[0]["order_id"]
 
-        product_id = reference_id if normalized_type == "Product" else None
-        ticket_type_id = reference_id if normalized_type == "Ticket" else None
-        booking_id = reference_id if normalized_type == "Party" else None
+        item_data = {
+            "order_id": order_id,
+            "item_type": normalized_type,
+            "product_id": reference_id if normalized_type == "Product" else None,
+            "ticket_type_id": reference_id if normalized_type == "Ticket" else None,
+            "booking_id": reference_id if normalized_type == "Party" else None,
+            "name_override": name_override.strip() or None,
+            "quantity": quantity,
+            "unit_price_usd": unit_price_usd,
+            "line_total_usd": line_total,
+        }
+        
+        db.insert("order_items", item_data)
 
-        cur.execute(
-            """
-            INSERT INTO order_items (
-                order_id, item_type, product_id, ticket_type_id, booking_id,
-                name_override, quantity, unit_price_usd, line_total_usd
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                order_id,
-                normalized_type,
-                product_id,
-                ticket_type_id,
-                booking_id,
-                name_override.strip() or None,
-                quantity,
-                unit_price_usd,
-                line_total,
-            ),
-        )
-
-        conn.commit()
         return f"Created order {order_id} ({order_type}) totaling ${line_total:.2f}."
-    finally:
-        _close_cursor(cur)
+    except Exception as e:
+        return f"Error creating order: {e}"
 
 
 @function_tool
@@ -1200,36 +856,29 @@ def record_payment(
     if not normalized_status:
         return "Payment status must be one of: " + ", ".join(PAYMENT_STATUSES)
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute("SELECT 1 FROM orders WHERE order_id = %s", (order_id,))
-        if not cur.fetchone():
-            conn.rollback()
+        order = db.get_by_id("orders", "order_id", order_id)
+        if not order:
             return "Order not found."
 
-        cur.execute(
-            """
-            INSERT INTO payments (order_id, provider, provider_payment_id, status, amount_usd)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING payment_id
-            """,
-            (
-                order_id,
-                provider.strip() or "Manual",
-                provider_payment_id.strip() or None,
-                normalized_status,
-                amount_usd,
-            ),
-        )
-        payment_id = cur.fetchone()[0]
-        conn.commit()
-        return (
-            f"Recorded payment {payment_id} ({normalized_status}) for order {order_id} "
-            f"in the amount of ${amount_usd:.2f}."
-        )
-    finally:
-        _close_cursor(cur)
+        payment_data = {
+            "order_id": order_id,
+            "provider": provider.strip() or "Manual",
+            "provider_payment_id": provider_payment_id.strip() or None,
+            "status": normalized_status,
+            "amount_usd": amount_usd,
+        }
+        
+        result = db.insert("payments", payment_data)
+        if result and len(result) > 0:
+            payment_id = result[0]["payment_id"]
+            return (
+                f"Recorded payment {payment_id} ({normalized_status}) for order {order_id} "
+                f"in the amount of ${amount_usd:.2f}."
+            )
+        return "Failed to record payment."
+    except Exception as e:
+        return f"Error recording payment: {e}"
 
 
 @function_tool
@@ -1245,41 +894,32 @@ def create_refund(
     if amount_usd <= 0:
         return "Refund amount must be greater than zero."
 
-    conn = get_connection()
-    cur = conn.cursor()
     try:
-        cur.execute("SELECT 1 FROM orders WHERE order_id = %s", (order_id,))
-        if not cur.fetchone():
-            conn.rollback()
+        order = db.get_by_id("orders", "order_id", order_id)
+        if not order:
             return "Order not found."
 
         if payment_id is not None:
-            cur.execute(
-                "SELECT 1 FROM payments WHERE payment_id = %s AND order_id = %s",
-                (payment_id, order_id),
-            )
-            if not cur.fetchone():
-                conn.rollback()
+            endpoint = f"payments?select=payment_id&payment_id=eq.{payment_id}&order_id=eq.{order_id}"
+            payment = db._make_request("GET", endpoint)
+            if not payment:
                 return "Payment not found for this order."
 
-        cur.execute(
-            """
-            INSERT INTO refunds (payment_id, order_id, status, reason, amount_usd)
-            VALUES (%s, %s, 'Pending', %s, %s)
-            RETURNING refund_id
-            """,
-            (
-                payment_id,
-                order_id,
-                reason.strip() or None,
-                amount_usd,
-            ),
-        )
-        refund_id = cur.fetchone()[0]
-        conn.commit()
-        return (
-            f"Created refund {refund_id} for order {order_id} in the amount of "
-            f"${amount_usd:.2f}."
-        )
-    finally:
-        _close_cursor(cur)
+        refund_data = {
+            "payment_id": payment_id,
+            "order_id": order_id,
+            "status": "Pending",
+            "reason": reason.strip() or None,
+            "amount_usd": amount_usd,
+        }
+        
+        result = db.insert("refunds", refund_data)
+        if result and len(result) > 0:
+            refund_id = result[0]["refund_id"]
+            return (
+                f"Created refund {refund_id} for order {order_id} in the amount of "
+                f"${amount_usd:.2f}."
+            )
+        return "Failed to create refund."
+    except Exception as e:
+        return f"Error creating refund: {e}"

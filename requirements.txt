@@ -1,0 +1,7 @@
+streamlit
+python-dotenv
+openai-agents
+langsmith[openai-agents]
+openai
+requests
+chromadb
